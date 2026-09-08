@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asaskevich/govalidator"
@@ -120,7 +121,7 @@ func (l *Logger) LogRequest(req *http.Request, userdata types.UserData) error {
 	// send to writer channel
 	l.asyncqueue <- types.HTTPTransaction{
 		Userdata: userdata,
-		Request:  req,
+		Request:  cloneRequestForLogging(req),
 	}
 
 	if l.harLogger != nil {
@@ -130,6 +131,56 @@ func (l *Logger) LogRequest(req *http.Request, userdata types.UserData) error {
 	}
 
 	return nil
+}
+
+// cloneRequestForLogging gives the asynchronous logger its own request body
+// while the original body continues to stream to the upstream server.
+func cloneRequestForLogging(req *http.Request) *http.Request {
+	clone := req.Clone(req.Context())
+	if req.Body == nil || req.Body == http.NoBody {
+		return clone
+	}
+
+	reader, writer := io.Pipe()
+	clone.Body = reader
+	clone.GetBody = nil
+	req.Body = &loggingBody{
+		body:   req.Body,
+		writer: writer,
+	}
+	return clone
+}
+
+type loggingBody struct {
+	body      io.ReadCloser
+	writer    *io.PipeWriter
+	closeOnce sync.Once
+}
+
+func (b *loggingBody) Read(data []byte) (int, error) {
+	n, readErr := b.body.Read(data)
+	if n > 0 {
+		// Logging is best effort. If its reader stops, forwarding must continue.
+		if _, writeErr := b.writer.Write(data[:n]); writeErr != nil {
+			b.closeLogging(nil)
+		}
+	}
+	if readErr != nil {
+		b.closeLogging(readErr)
+	}
+	return n, readErr
+}
+
+func (b *loggingBody) Close() error {
+	err := b.body.Close()
+	b.closeLogging(err)
+	return err
+}
+
+func (b *loggingBody) closeLogging(err error) {
+	b.closeOnce.Do(func() {
+		_ = b.writer.CloseWithError(err)
+	})
 }
 
 // LogResponse and user data
